@@ -108,28 +108,30 @@ type BaseOptions struct {
 
 // CollectOptions contains the options defining which type of data to collect
 type CollectOptions struct {
-	RawRequest      interface{}       // raw collect command or request
-	Mode            string            // the cluster is deployed with what type of tool
-	DiagMode        string            // run diag collect at command line mode or server mode
-	ProfileName     string            // the name of a pre-defined collecting profile
-	Collectors      CollectTree       // struct to show which collector is enabled
-	MetricsFilter   []string          // prefix of metrics to collect
-	MetricsExclude  []string          // prefix of metrics to exclude
-	MetricsLabel    map[string]string // label to filte metrics
-	Dir             string            // target directory to store collected data
-	Limit           int               // rate limit of SCP
-	MetricsLimit    int               // query limit of one request
-	PerfDuration    int               // seconds: profile time(s), default is 30s.
-	CompressScp     bool              // compress of files during collecting
-	CompressMetrics bool              // compress of files during collecting
-	RawMonitor      bool              // collect raw data for metrics
-	ExitOnError     bool              // break the process and exit when an error occur
-	ExtendedAttrs   map[string]string // extended attributes used for manual collecting mode
-	ExplainSQLPath  string            // File path for explain sql
-	ExplainSqls     []string          // explain sqls
-	CurrDB          string
-	Header          []string
-	UsePortForward  bool // use portforward when call api inside k8s cluster
+	RawRequest         interface{}       // raw collect command or request
+	Mode               string            // the cluster is deployed with what type of tool
+	DiagMode           string            // run diag collect at command line mode or server mode
+	ProfileName        string            // the name of a pre-defined collecting profile
+	Collectors         CollectTree       // struct to show which collector is enabled
+	MetricsFilter      []string          // prefix of metrics to collect
+	MetricsExclude     []string          // prefix of metrics to exclude
+	MetricsLabel       map[string]string // label to filte metrics
+	Dir                string            // target directory to store collected data
+	Limit              int               // rate limit of SCP
+	MetricsLimit       int               // query limit of one request
+	MetricsMinInterval int               // query minimum interval of one request, default is 1min.
+	PerfDuration       int               // seconds: profile time(s), default is 30s.
+	CompressScp        bool              // compress of files during collecting
+	CompressMetrics    bool              // compress of files during collecting
+	RawMonitor         bool              // collect raw data for metrics
+	StripLabels        []string          // label names to strip from collected metrics
+	ExitOnError        bool              // break the process and exit when an error occur
+	ExtendedAttrs      map[string]string // extended attributes used for manual collecting mode
+	ExplainSQLPath     string            // File path for explain sql
+	ExplainSqls        []string          // explain sqls
+	CurrDB             string
+	Header             []string
+	UsePortForward     bool // use portforward when call api inside k8s cluster
 }
 
 // CollectStat is estimated size stats of data to be collected
@@ -222,6 +224,12 @@ func (m *Manager) CollectClusterInfo(
 		return "", err
 	}
 
+	if cOpt.ProfileName == "" {
+		if _, err := readProfile("default"); err == nil {
+			cOpt.ProfileName = "default"
+		}
+	}
+
 	if cOpt.ProfileName != "" {
 		cp, err := readProfile(cOpt.ProfileName)
 		if err != nil {
@@ -236,12 +244,17 @@ func (m *Manager) CollectClusterInfo(
 		}
 		logprinter.Infof("%s", msg)
 
-		cOpt.Collectors, err = ParseCollectTree(cp.Collectors, nil)
-		if err != nil {
-			return "", err
+		if len(cp.Collectors) > 0 {
+			cOpt.Collectors, err = ParseCollectTree(cp.Collectors, nil)
+			if err != nil {
+				return "", err
+			}
 		}
 		gOpt.Roles = append(gOpt.Roles, cp.Roles...)
 		cOpt.MetricsFilter = append(cOpt.MetricsFilter, cp.MetricFilters...)
+		if len(cp.StripLabels) > 0 && len(cOpt.StripLabels) == 0 {
+			cOpt.StripLabels = cp.StripLabels
+		}
 	}
 
 	var explainSqls []string
@@ -301,9 +314,11 @@ func (m *Manager) CollectClusterInfo(
 				filter:       cOpt.MetricsFilter,
 				exclude:      cOpt.MetricsExclude,
 				limit:        cOpt.MetricsLimit,
+				minInterval:  cOpt.MetricsMinInterval,
 				compress:     cOpt.CompressMetrics,
 				customHeader: cOpt.Header,
 				portForward:  cOpt.UsePortForward,
+				stripLabels:  cOpt.StripLabels,
 			},
 		)
 	}
@@ -686,7 +701,7 @@ func ParseCollectTree(include, exclude []string) (CollectTree, error) {
 			num := reflectV.NumField()
 			var i int
 			for i = 0; i < num; i++ {
-				if strings.ToLower(k) == strings.ToLower(reflectV.Type().Field(i).Name) {
+				if strings.EqualFold(k, reflectV.Type().Field(i).Name) {
 					reflectV = reflectV.Field(i)
 					break
 				}
@@ -708,7 +723,7 @@ func ParseCollectTree(include, exclude []string) (CollectTree, error) {
 			num := reflectV.NumField()
 			var i int
 			for i = 0; i < num; i++ {
-				if strings.ToLower(k) == strings.ToLower(reflectV.Type().Field(i).Name) {
+				if strings.EqualFold(k, reflectV.Type().Field(i).Name) {
 					reflectV = reflectV.Field(i)
 					break
 				}

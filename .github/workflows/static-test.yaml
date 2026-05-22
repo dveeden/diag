@@ -24,12 +24,14 @@ jobs:
   unit-test:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out code into the Go module directory
-        uses: actions/checkout@v5
+      - name: Check out code
+        uses: actions/checkout@v6
+
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
           go-version-file: 'go.mod'
+
       - name: make unit-test
         run: |
           make check

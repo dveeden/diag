@@ -104,7 +104,7 @@ func newCollectCmd() *cobra.Command {
 			}
 			cOpt.Mode = collector.CollectModeTiUP
 
-			if cOpt.CompressMetrics == false {
+			if !cOpt.CompressMetrics {
 				log.Warnf("%s", color.YellowString("Uncompressed metrics may not be handled correctly by Clinic, use it only when you really need it"))
 			}
 
@@ -160,6 +160,7 @@ func newCollectCmd() *cobra.Command {
 	cmd.Flags().IntVar(&cOpt.MetricsLimit, "metricslimit", 10000, "metric size limit of single request, specified in series*hour per request")
 	cmd.Flags().StringVar(&metricsConf, "metricsconfig", "", "config file of metricsfilter")
 	cmd.Flags().StringSliceVar(&labels, "metricslabel", nil, "only collect metrics that match labels")
+	cmd.Flags().IntVar(&cOpt.MetricsMinInterval, "metrics-min-interval", 120, "the minimum interval of a single request in seconds")
 	cmd.Flags().StringVar(&promEndpoint, "overwrite-prometheus-endpoint", "", "Prometheus endpoint")
 	cmd.Flags().StringSliceVarP(&cOpt.Header, "prometheus-header", "H", nil, "custom headers of http request when collect metrics")
 	cmd.Flags().StringVarP(&cOpt.Dir, "output", "o", "", "output directory of collected data")
@@ -168,6 +169,7 @@ func newCollectCmd() *cobra.Command {
 	cmd.Flags().Uint64Var(&gOpt.APITimeout, "api-timeout", 60, "Timeout in seconds when querying APIs.")
 	cmd.Flags().BoolVar(&cOpt.CompressScp, "compress-scp", true, "Compress when transfer config and logs.Only works with system ssh")
 	cmd.Flags().BoolVar(&cOpt.CompressMetrics, "compress-metrics", true, "Compress collected metrics data.")
+	cmd.Flags().StringSliceVar(&cOpt.StripLabels, "strip-labels", nil, "Comma-separated list of label names to strip from collected metrics.")
 	cmd.Flags().BoolVar(&cOpt.ExitOnError, "exit-on-error", false, "Stop collecting and exit if an error occurs.")
 	cmd.Flags().BoolVar(&cOpt.RawMonitor, "raw-monitor", false, "Collect raw prometheus data")
 	cmd.Flags().StringVar(&cOpt.ExplainSQLPath, "explain-sql", "", "File path for explain sql")

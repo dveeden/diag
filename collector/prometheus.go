@@ -14,10 +14,12 @@
 package collector
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"maps"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -54,7 +56,7 @@ const (
 	subdirMetrics = "metrics"
 	subdirRaw     = "raw"
 	maxQueryRange = 120 * 60 // 120min
-	minQueryRange = 5 * 60   // 5min
+	minQueryRange = 1 * 60   // 1min
 )
 
 type collectMonitor struct {
@@ -116,25 +118,26 @@ func (c *AlertCollectOptions) Collect(m *Manager, topo *models.TiDBCluster) erro
 		monitors = append(monitors, eps.([]string)...)
 	} else {
 		for _, prom := range topo.Monitors {
-			monitors = append(monitors, fmt.Sprintf("%s:%d", prom.Host(), prom.MainPort()))
+			// todo: check is TLS enabled in tiup deployed prometheus
+			monitors = append(monitors, fmt.Sprintf("http://%s:%d", prom.Host(), prom.MainPort()))
 		}
 	}
 
 	var queryOK bool
 	var queryErr error
 	for _, promAddr := range monitors {
-		if err := ensureMonitorDir(c.resultDir, subdirAlerts, strings.ReplaceAll(promAddr, ":", "-")); err != nil {
+		if err := ensureMonitorDir(c.resultDir, subdirAlerts, utils.URL2Name(promAddr)); err != nil {
 			return err
 		}
 
 		client := &http.Client{Timeout: time.Second * time.Duration(c.opt.APITimeout)}
-		resp, err := client.PostForm(fmt.Sprintf("http://%s/api/v1/query", promAddr), url.Values{"query": {"ALERTS"}})
+		resp, err := client.PostForm(fmt.Sprintf("%s/api/v1/query", promAddr), url.Values{"query": {"ALERTS"}})
 		if err != nil {
 			return err
 		}
 		defer resp.Body.Close()
 
-		f, err := os.Create(filepath.Join(c.resultDir, subdirMonitor, subdirAlerts, strings.ReplaceAll(promAddr, ":", "-"), "alerts.json"))
+		f, err := os.Create(filepath.Join(c.resultDir, subdirMonitor, subdirAlerts, utils.URL2Name(promAddr), "alerts.json"))
 		if err == nil {
 			queryOK = true
 		} else {
@@ -177,11 +180,13 @@ type MetricCollectOptions struct {
 	filter       []string
 	exclude      []string
 	limit        int // series*min per query
+	minInterval  int // the minimum interval of a single request in seconds
 	compress     bool
 	customHeader []string
 	endpoint     string
 	portForward  bool
 	stopChans    []chan struct{}
+	stripLabels  []string
 }
 
 // Desc implements the Collector interface
@@ -231,9 +236,10 @@ func (c *MetricCollectOptions) Prepare(m *Manager, topo *models.TiDBCluster) (ma
 				return nil, err
 			}
 			c.stopChans = append(c.stopChans, stopChan)
-			c.endpoint = fmt.Sprintf("127.0.0.1:%d", port)
+			c.endpoint = fmt.Sprintf("http://127.0.0.1:%d", port)
 		} else {
-			c.endpoint = fmt.Sprintf("%s:%d", prom.Host(), prom.MainPort())
+			// todo: detect TLS enabled from tiup
+			c.endpoint = fmt.Sprintf("http://%s:%d", prom.Host(), prom.MainPort())
 		}
 	} else {
 		m.logger.Warnf("No Prometheus node found in topology, skip.")
@@ -248,7 +254,7 @@ func (c *MetricCollectOptions) Prepare(m *Manager, topo *models.TiDBCluster) (ma
 	if err := tiuputils.Retry(
 		func() error {
 			var queryErr error
-			c.metrics, queryErr = getMetricList(client, c.endpoint, c.customHeader)
+			c.metrics, queryErr = getMetricList(client, c.endpoint, c.customHeader, tsStart.Format(time.RFC3339), tsEnd.Format(time.RFC3339))
 			return queryErr
 		},
 		tiuputils.RetryOption{
@@ -287,8 +293,11 @@ func (c *MetricCollectOptions) Collect(m *Manager, topo *models.TiDBCluster) err
 	mu := sync.Mutex{}
 
 	key := c.endpoint
+	if c.minInterval < minQueryRange {
+		c.minInterval = minQueryRange
+	}
 	if _, ok := bars[key]; !ok {
-		bars[key] = mb.AddBar(fmt.Sprintf("  - Querying server %s", key))
+		bars[key] = mb.AddBar(fmt.Sprintf("  - Querying server %s, min interval %v", key, c.minInterval))
 	}
 
 	if m.diagMode == DiagModeCmd {
@@ -304,7 +313,7 @@ func (c *MetricCollectOptions) Collect(m *Manager, topo *models.TiDBCluster) err
 	tl := utils.NewTokenLimiter(uint(qLimit))
 
 	done := 1
-	if err := ensureMonitorDir(c.resultDir, subdirMetrics, strings.ReplaceAll(c.endpoint, ":", "-")); err != nil {
+	if err := ensureMonitorDir(c.resultDir, subdirMetrics, utils.URL2Name(c.endpoint)); err != nil {
 		bars[key].UpdateDisplay(&progress.DisplayProps{
 			Prefix: fmt.Sprintf("  - Query server %s: %s", key, err),
 			Mode:   progress.ModeError,
@@ -312,7 +321,19 @@ func (c *MetricCollectOptions) Collect(m *Manager, topo *models.TiDBCluster) err
 		return err
 	}
 
-	client := &http.Client{Timeout: time.Second * time.Duration(c.opt.APITimeout)}
+	client := &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:          qLimit * 2,
+			MaxIdleConnsPerHost:   10,
+			IdleConnTimeout:       30 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			DialContext: (&net.Dialer{
+				Timeout:   5 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+		},
+		Timeout: time.Second * time.Duration(c.opt.APITimeout),
+	}
 	for _, mtc := range c.metrics {
 		go func(tok *utils.Token, mtc string) {
 			bars[key].UpdateDisplay(&progress.DisplayProps{
@@ -322,7 +343,7 @@ func (c *MetricCollectOptions) Collect(m *Manager, topo *models.TiDBCluster) err
 
 			tsEnd, _ := utils.ParseTime(c.GetBaseOptions().ScrapeEnd)
 			tsStart, _ := utils.ParseTime(c.GetBaseOptions().ScrapeBegin)
-			collectMetric(m.logger, client, key, tsStart, tsEnd, mtc, c.label, c.resultDir, c.limit, c.compress, c.customHeader, "")
+			collectMetric(m.logger, client, key, tsStart, tsEnd, mtc, c.label, c.resultDir, c.limit, c.minInterval, c.compress, c.customHeader, "", c.stripLabels)
 
 			mu.Lock()
 			done++
@@ -337,14 +358,22 @@ func (c *MetricCollectOptions) Collect(m *Manager, topo *models.TiDBCluster) err
 			tl.Put(tok)
 		}(tl.Get(), mtc)
 	}
+	m.logger.Infof("Collected metrics ...")
 
 	tl.Wait()
 
 	return nil
 }
 
-func getMetricList(c *http.Client, addr string, customHeader []string) ([]string, error) {
-	return getAPIData[[]string](c, makeURL(addr, "/api/v1/label/__name__/values", nil), customHeader)
+func getMetricList(c *http.Client, addr string, customHeader []string, start, end string) ([]string, error) {
+	queries := make(map[string]string)
+	if start != "" {
+		queries["start"] = start
+	}
+	if end != "" {
+		queries["end"] = end
+	}
+	return getAPIData[[]string](c, makeURL(addr, "/api/v1/label/__name__/values", queries), customHeader)
 }
 
 func getInstanceList(c *http.Client, addr string, queries map[string]string, customHeader []string) ([]string, error) {
@@ -387,7 +416,10 @@ func getAPIData[T any](c *http.Client, url string, customHeader []string) (T, er
 }
 
 func makeURL(addr string, path string, queries map[string]string) string {
-	link := "http://" + addr + path
+	link := addr + path
+	if !strings.HasPrefix(addr, "http://") && !strings.HasPrefix(addr, "https://") {
+		link = "http://" + link
+	}
 	if len(queries) == 0 {
 		return link
 	}
@@ -407,9 +439,11 @@ func collectMetric(
 	label map[string]string,
 	resultDir string,
 	speedlimit int,
+	minInterval int,
 	compress bool,
 	customHeader []string,
 	instance string,
+	stripLabels []string,
 ) {
 	nameSuffix := ""
 	if len(instance) > 0 {
@@ -466,7 +500,7 @@ func collectMetric(
 				newLabel := make(map[string]string)
 				maps.Copy(newLabel, label)
 				newLabel["instance"] = instance
-				collectMetric(l, c, promAddr, beginTime, endTime, mtc, newLabel, resultDir, speedlimit, compress, customHeader, instance)
+				collectMetric(l, c, promAddr, beginTime, endTime, mtc, newLabel, resultDir, speedlimit, minInterval, compress, customHeader, instance, stripLabels)
 			}
 		}
 		return
@@ -485,8 +519,8 @@ func collectMetric(
 	if block > maxQueryRange {
 		block = maxQueryRange
 	}
-	if block < minQueryRange {
-		block = minQueryRange
+	if block < minInterval {
+		block = minInterval
 	}
 
 	l.Debugf("Dumping metric %s-%s-%s%s...", mtc, beginTime.Format(time.RFC3339), endTime.Format(time.RFC3339), nameSuffix)
@@ -501,7 +535,7 @@ func collectMetric(
 			func() error {
 				req, err := http.NewRequest(
 					http.MethodGet,
-					fmt.Sprintf("http://%s/api/v1/query?%s", promAddr, url.Values{
+					fmt.Sprintf("%s/api/v1/query?%s", promAddr, url.Values{
 						"query": {fmt.Sprintf("%s[%ds]", query, querySec)},
 						"time":  {queryEnd.Format(time.RFC3339)},
 					}.Encode()),
@@ -523,7 +557,7 @@ func collectMetric(
 
 				dst, err := os.Create(
 					filepath.Join(
-						resultDir, subdirMonitor, subdirMetrics, strings.ReplaceAll(promAddr, ":", "-"),
+						resultDir, subdirMonitor, subdirMetrics, utils.URL2Name(promAddr),
 						fmt.Sprintf("%s-%s-%s%s.json", mtc, queryBegin.Format(time.RFC3339), queryEnd.Format(time.RFC3339), nameSuffix),
 					),
 				)
@@ -545,7 +579,47 @@ func collectMetric(
 				} else {
 					enc = dst
 				}
-				n, err = io.Copy(enc, resp.Body)
+
+				var reader io.Reader = resp.Body
+				if len(stripLabels) > 0 {
+					body, readErr := io.ReadAll(resp.Body)
+					if readErr != nil {
+						l.Errorf("failed reading metric %s: %s, retry...\n", mtc+nameSuffix, readErr)
+						return readErr
+					}
+					var raw map[string]json.RawMessage
+					if err := json.Unmarshal(body, &raw); err == nil {
+						var data map[string]json.RawMessage
+						if err := json.Unmarshal(raw["data"], &data); err == nil {
+							var results []map[string]json.RawMessage
+							if err := json.Unmarshal(data["result"], &results); err == nil {
+								for i, r := range results {
+									var metric map[string]any
+									if err := json.Unmarshal(r["metric"], &metric); err == nil {
+										for _, label := range stripLabels {
+											delete(metric, label)
+										}
+										if b, err := json.Marshal(metric); err == nil {
+											results[i]["metric"] = b
+										}
+									}
+								}
+								if b, err := json.Marshal(results); err == nil {
+									data["result"] = b
+								}
+							}
+							if b, err := json.Marshal(data); err == nil {
+								raw["data"] = b
+							}
+						}
+						if b, err := json.Marshal(raw); err == nil {
+							body = b
+						}
+					}
+					reader = bytes.NewReader(body)
+				}
+
+				n, err = io.Copy(enc, reader)
 				if err != nil {
 					l.Errorf("failed writing metric %s to file: %s, retry...\n", mtc+nameSuffix, err)
 					return err
